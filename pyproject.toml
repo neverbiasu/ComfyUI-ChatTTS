@@ -1,0 +1,15 @@
+[project]
+name = "chattts"
+description = "A ComfyUI integration for [a/ChatTTS](https://github.com/2noise/ChatTTS), enabling high-quality, controllable text-to-speech generation directly in your ComfyUI workflows."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["numpy<2.0.0", "numba", "torch>=2.1.0", "torchaudio", "tqdm", "vector_quantize_pytorch", "transformers>=4.41.1", "vocos", "IPython", "pybase16384", "pynini==2.1.5; sys_platform == 'linux'", "WeTextProcessing; sys_platform == 'linux'", "nemo_text_processing; sys_platform == 'linux'", "av", "pydub"]
+
+[project.urls]
+Repository = "https://github.com/neverbiasu/ComfyUI-ChatTTS"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-ChatTTS"
+Icon = ""
