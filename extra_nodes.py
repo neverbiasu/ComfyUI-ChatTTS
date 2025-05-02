@@ -221,7 +221,3 @@ class ChatTTS_LoadSpeakerProfile:
         except Exception as e:
             logger.error(f"Error loading speaker profile: {e}")
             return ({"error": str(e)},)
-
-
-# This file now imports from the nodes directory
-from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
