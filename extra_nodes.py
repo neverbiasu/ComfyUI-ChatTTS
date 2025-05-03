@@ -28,12 +28,56 @@ class ChatTTS_ExtractSpeaker:
     CATEGORY = "chattts"
 
     def extract(self, model, audio):
-        # Extract speaker embeddings from input audio
-        waveform = audio["waveform"].squeeze(0)
-        logger.info(f"Extracting speaker from audio: shape={waveform.shape}")
-        spk_emb = model.sample_audio_speaker(waveform.cpu().numpy())
-        logger.info(f"Speaker embedding extracted successfully")
-        return ({"spk_emb": spk_emb},)
+        try:
+            # Get waveform and convert to appropriate format
+            waveform = audio["waveform"]
+            logger.info(
+                f"Original audio shape: {waveform.shape}, dimensions: {waveform.dim()}"
+            )
+
+            # 1. Format audio to the correct format: should be a float 1D array
+            if waveform.dim() == 4:  # [batch, batch, channels, samples]
+                waveform = waveform[0, 0]
+            elif waveform.dim() == 3:  # [batch, channels, samples]
+                waveform = waveform[0, 0]
+            elif waveform.dim() == 2:  # [channels, samples]
+                waveform = waveform[0]
+
+            # Ensure it is continuous 1D data
+            if waveform.dim() > 1:
+                waveform = waveform.reshape(-1)
+
+            # 2. Convert to numpy, ensure type is float32
+            # Key point 1: Use the correct data type
+            wav_numpy = waveform.cpu().float().numpy().astype(np.float32)
+
+            # Key point 2: Ensure audio length is sufficient (not caused by filter parameters)
+            n_fft = model.config.vocos.feature_extractor.init_args.n_fft
+            if len(wav_numpy) < n_fft:
+                padded = np.zeros(n_fft, dtype=np.float32)
+                padded[: len(wav_numpy)] = wav_numpy
+                wav_numpy = padded
+
+            # Key point 3: Normalize audio amplitude (Important!)
+            if np.abs(wav_numpy).max() > 1.0:
+                wav_numpy = wav_numpy / np.abs(wav_numpy).max()
+
+            # Directly call the model method for processing
+            try:
+                # Use copy to ensure data continuity
+                spk_emb = model.sample_audio_speaker(wav_numpy.copy())
+                logger.info(
+                    f"Speaker embedding extracted successfully, length: {len(spk_emb)}"
+                )
+                return ({"spk_emb": spk_emb},)
+            except Exception as inner_e:
+                logger.error(f"Error in speaker extraction: {inner_e}", exc_info=True)
+                # Here you can choose to return an error or use a random speaker
+                raise  # Let the outer try-except catch this error
+
+        except Exception as e:
+            logger.error(f"Fatal error in extract_speaker: {e}", exc_info=True)
+            return ({"error": str(e)},)
 
 
 class ChatTTS_TextNormalizer:
@@ -108,8 +152,10 @@ class ChatTTS_TextSplitter:
         if split_method == "newline":
             parts = text.split("\n")
         elif split_method == "sentences":
-            parts = re.split(r'(?<=。)|(?<=\.\s)|(?<=\!)|(?<=\?)', text)
+            # Split by periods, exclamation marks, question marks followed by space or end of string
+            parts = re.split(r'(?<=[.!?])\s*', text)
         elif split_method == "paragraphs":
+            # Split by one or more empty lines
             parts = re.split(r'\n\s*\n', text)
 
         # Filter empty parts
@@ -145,23 +191,40 @@ class ChatTTS_SpeakerMixer:
 
     def mix(self, speaker_params_1, speaker_params_2, mix_ratio):
         # Simple linear interpolation of speaker embeddings
-        spk_emb_1 = speaker_params_1.get("spk_emb", "")
-        spk_emb_2 = speaker_params_2.get("spk_emb", "")
+        spk_emb_1 = speaker_params_1.get("spk_emb")
+        spk_emb_2 = speaker_params_2.get("spk_emb")
 
-        if not spk_emb_1 or not spk_emb_2:
-            logger.warning("One of the speaker embeddings is empty")
-            return (speaker_params_1 if spk_emb_1 else speaker_params_2,)
+        if spk_emb_1 is None or spk_emb_2 is None:
+            logger.warning("One or both speaker embeddings are missing or None.")
+            # Return the one that is not None, or the first one if both are None (or an error dict)
+            return (speaker_params_1 if spk_emb_1 is not None else speaker_params_2,)
 
-        # Assuming speaker embeddings are base64 strings, we need to decode them
-        # This is a simplified version, actual implementation depends on the format
-        import base64
+        # Assuming spk_emb are numpy arrays or tensors that support arithmetic operations
+        try:
+            # Ensure they are tensors for interpolation
+            if isinstance(spk_emb_1, np.ndarray):
+                spk_emb_1 = torch.from_numpy(spk_emb_1)
+            if isinstance(spk_emb_2, np.ndarray):
+                spk_emb_2 = torch.from_numpy(spk_emb_2)
 
-        # Parse speaker embeddings (exact parsing depends on ChatTTS format)
-        # For now, we'll just blend the two with the mix ratio
-        mixed_emb = f"{spk_emb_1[:10]}...{spk_emb_2[10:20]}...{mix_ratio}"
+            if not isinstance(spk_emb_1, torch.Tensor) or not isinstance(spk_emb_2, torch.Tensor):
+                 raise TypeError("Speaker embeddings must be NumPy arrays or PyTorch tensors.")
 
-        logger.info(f"Mixed speaker embeddings with ratio {mix_ratio}")
-        return ({"spk_emb": mixed_emb},)
+            if spk_emb_1.shape != spk_emb_2.shape:
+                logger.error(f"Speaker embeddings have different shapes: {spk_emb_1.shape} vs {spk_emb_2.shape}")
+                # Handle shape mismatch, e.g., return an error or one of the inputs
+                return ({"error": "Speaker embeddings shape mismatch"},)
+
+            # Perform linear interpolation
+            mixed_emb = (1 - mix_ratio) * spk_emb_1 + mix_ratio * spk_emb_2
+
+            logger.info(f"Mixed speaker embeddings with ratio {mix_ratio}")
+            # Return the mixed embedding in the expected dictionary format
+            return ({"spk_emb": mixed_emb},)
+
+        except Exception as e:
+            logger.error(f"Error mixing speaker embeddings: {e}", exc_info=True)
+            return ({"error": f"Mixing error: {e}"},)
 
 
 class ChatTTS_SaveSpeakerProfile:
@@ -170,7 +233,7 @@ class ChatTTS_SaveSpeakerProfile:
         return {
             "required": {
                 "speaker_params": ("DICT", {}),
-                "filename": ("STRING", {"default": "speaker_profile.json"}),
+                "filename": ("STRING", {"default": "speaker_profile.pt"}), # Changed default extension
             }
         }
 
@@ -180,17 +243,26 @@ class ChatTTS_SaveSpeakerProfile:
     OUTPUT_NODE = True
 
     def save(self, speaker_params, filename):
-        import json
-
         output_dir = folder_paths.get_output_directory()
         os.makedirs(output_dir, exist_ok=True)
 
-        filepath = os.path.join(output_dir, filename)
-        with open(filepath, 'w') as f:
-            json.dump(speaker_params, f, indent=2)
+        # Ensure filename has a .pt extension for clarity
+        if not filename.lower().endswith(".pt"):
+            filename += ".pt"
 
-        logger.info(f"Saved speaker profile to {filepath}")
-        return {}
+        filepath = os.path.join(output_dir, filename)
+
+        try:
+            # Save the dictionary containing the tensor using torch.save
+            # This handles tensors correctly
+            torch.save(speaker_params, filepath)
+            logger.info(f"Saved speaker profile to {filepath}")
+        except Exception as e:
+             logger.error(f"Error saving speaker profile: {e}", exc_info=True)
+             # Optionally, re-raise or handle the error appropriately
+             # raise e
+
+        return {} # Return empty tuple for OUTPUT_NODE = True
 
 
 class ChatTTS_LoadSpeakerProfile:
@@ -198,7 +270,8 @@ class ChatTTS_LoadSpeakerProfile:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "filepath": ("STRING", {"default": "speaker_profile.json"}),
+                # Allow selecting file from input directory
+                "filepath": (folder_paths.get_filename_list("speaker_profiles"), ),
             }
         }
 
@@ -207,17 +280,30 @@ class ChatTTS_LoadSpeakerProfile:
     CATEGORY = "chattts"
 
     def load(self, filepath):
-        import json
+        # Construct full path using the input directory
+        input_dir = folder_paths.get_input_directory()
+        full_filepath = os.path.join(input_dir, filepath)
 
-        if not os.path.isabs(filepath):
-            filepath = os.path.join(folder_paths.get_input_directory(), filepath)
+        if not os.path.exists(full_filepath):
+             logger.error(f"Speaker profile file not found: {full_filepath}")
+             return ({"error": f"File not found: {filepath}"},)
 
         try:
-            with open(filepath, 'r') as f:
-                speaker_params = json.load(f)
+            # Load the dictionary using torch.load
+            # map_location='cpu' ensures it loads correctly even if saved on GPU
+            speaker_params = torch.load(full_filepath, map_location='cpu')
+
+            # Basic validation if it's a dictionary and contains 'spk_emb'
+            if not isinstance(speaker_params, dict) or "spk_emb" not in speaker_params:
+                logger.error(f"Invalid speaker profile format in {filepath}. Expected a dict with 'spk_emb'.")
+                return ({"error": "Invalid profile format"},)
+
+            # Ensure the embedding is on the correct device if needed later, though CPU is often fine for parameters
+            # if isinstance(speaker_params.get("spk_emb"), torch.Tensor):
+            #     speaker_params["spk_emb"] = speaker_params["spk_emb"].to(torch.device("cpu")) # Or your target device
 
             logger.info(f"Loaded speaker profile from {filepath}")
             return (speaker_params,)
         except Exception as e:
-            logger.error(f"Error loading speaker profile: {e}")
+            logger.error(f"Error loading speaker profile from {filepath}: {e}", exc_info=True)
             return ({"error": str(e)},)

@@ -121,12 +121,30 @@ class ChatTTS_SeedBasedSpeaker:
     CATEGORY = "chattts"
 
     def generate(self, model, seed):
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        try:
+            # Generate speaker embedding using a fixed seed
+            with TorchSeedContext(seed):
+                spk_emb = model.sample_random_speaker()
 
-        spk_emb = model.sample_random_speaker()
+            # Debug info: print the first 50 characters and length of the generated speaker embedding
+            logger.info(f"SeedBasedSpeaker - spk_emb prefix: {spk_emb[:50]}...")
+            logger.info(f"SeedBasedSpeaker - spk_emb length: {len(spk_emb)}")
 
-        return ({"spk_emb": spk_emb, "seed": seed},)
+            # Attempt decoding for verification
+            try:
+                decoded = model.speaker._decode(spk_emb)
+                logger.info(
+                    f"SeedBasedSpeaker - decoded shape: {decoded.shape}, type: {type(decoded)}"
+                )
+            except Exception as decode_err:
+                logger.error(
+                    f"SeedBasedSpeaker - decode verification failed: {decode_err}"
+                )
+
+            return ({"spk_emb": spk_emb, "seed": seed, "source": "seed_based"},)
+        except Exception as e:
+            logger.error(f"Error generating seed-based speaker: {e}")
+            return ({"error": str(e)},)
 
 
 class ChatTTS_Sampler:
@@ -168,25 +186,55 @@ class ChatTTS_Sampler:
         top_K=20,
         split_batch=0,
     ):
-        # Implementation following WebUI funcs.py
+        # Get speaker embedding (if available)
         spk_emb = speaker_params.get("spk_emb", "") if speaker_params else ""
-        logger.info(
-            f"ChatTTS audio synthesis: text length={len(text)}, speaker encoding length={len(spk_emb) if spk_emb else 0}"
-        )
+        spk_seed = speaker_params.get("seed", seed) if speaker_params else seed
+        source = speaker_params.get("source", "unknown") if speaker_params else "none"
 
-        # Construct parameters using same approach as WebUI
-        params_infer_code = Chat.InferCodeParams(
-            spk_emb=spk_emb,
-            temperature=temperature,
-            top_P=top_P,
-            top_K=top_K,
-            manual_seed=seed,
-        )
+        logger.info(f"ChatTTS_Sampler - received speaker from source: {source}")
+        logger.info(f"ChatTTS_Sampler - using seed: {spk_seed}")
 
         try:
-            logger.info(f"Starting inference: split_batch={split_batch}")
-            with TorchSeedContext(seed):
-                # Call infer method as in WebUI, without streaming
+            # First method: Manually modify ChatTTS internal state to ensure seed consistency
+            # This is a direct intervention into the internal mechanism of ChatTTS
+            with TorchSeedContext(spk_seed):
+                # First, fix the random state
+                import random
+
+                random_state = random.getstate()
+                torch_state = torch.get_rng_state()
+
+                # 1. If embedding exists and is decodable, use it
+                if spk_emb:
+                    try:
+                        test_decode = model.speaker._decode(spk_emb)
+                        logger.info(
+                            f"Using the provided spk_emb, shape: {test_decode.shape}"
+                        )
+                    except Exception as decode_error:
+                        logger.error(f"spk_emb decoding failed: {decode_error}")
+                        spk_emb = model.sample_random_speaker()
+                        logger.info(f"Switched to using randomly generated spk_emb")
+                # 2. Otherwise, generate a new embedding
+                else:
+                    spk_emb = model.sample_random_speaker()
+                    logger.info(f"Using spk_emb generated with seed={spk_seed}")
+
+                # Build parameters - Key: use the same seed as used for spk_emb generation
+                params_infer_code = Chat.InferCodeParams(
+                    spk_emb=spk_emb,
+                    temperature=temperature,
+                    top_P=top_P,
+                    top_K=top_K,
+                    manual_seed=spk_seed,  # Actively set the seed, same as the seed used previously for spk_emb generation
+                )
+
+                # Restore random state to ensure the following infer uses a clean state
+                random.setstate(random_state)
+                torch.set_rng_state(torch_state)
+
+                # Generate audio
+                logger.info(f"Starting inference: split_batch={split_batch}")
                 wav = model.infer(
                     text,
                     skip_refine_text=True,
@@ -203,9 +251,11 @@ class ChatTTS_Sampler:
             # Defensive check - ensure wav is not None and has at least one element
             if wav is None or len(wav) == 0:
                 logger.error("Model returned empty wav or None")
-                # Create default empty audio
+                # Create default empty audio - note the format!
                 empty_audio = {
-                    "waveform": torch.zeros((1, 100)),
+                    "waveform": torch.zeros(
+                        (1, 1, 100)
+                    ),  # [batch=1, channels=1, samples=100]
                     "sample_rate": 24000,
                 }
                 meta = {
@@ -215,11 +265,11 @@ class ChatTTS_Sampler:
                 }
                 return (empty_audio, meta)
 
-            # Ensure wav[0] exists and has correct format
+            # Ensure wav[0] exists and has the correct format
             if not isinstance(wav[0], (list, tuple, np.ndarray)):
                 logger.error(f"wav[0] has incorrect type: {type(wav[0])}")
                 empty_audio = {
-                    "waveform": torch.zeros((1, 100)),
+                    "waveform": torch.zeros((1, 1, 100)),  # Consistent 3D tensor format
                     "sample_rate": 24000,
                 }
                 meta = {
@@ -229,14 +279,13 @@ class ChatTTS_Sampler:
                 }
                 return (empty_audio, meta)
 
-            # Process return value - ensure tensor has correct format
+            # Process return value - ensure the tensor has the correct format
             tensor = torch.tensor(wav[0], dtype=torch.float32)
             logger.info(
                 f"Audio tensor: shape={tensor.shape}, dimensions={tensor.dim()}"
             )
 
-            # Ensure audio data is in the format required by torchaudio.save [batch_size, channels, samples]
-            # PreviewAudio node expects an iterable waveform to iterate over each batch
+            # Ensure audio data format meets torchaudio.save requirements [batch_size, channels, samples]
             if tensor.dim() == 1:
                 # 1D tensor [samples] -> 3D tensor [1, 1, samples]
                 tensor = tensor.reshape(1, 1, -1).contiguous()
@@ -250,7 +299,7 @@ class ChatTTS_Sampler:
                     f"Adjusted 2D tensor to 3D [1, channels, samples], new shape={tensor.shape}"
                 )
             else:
-                # Ensure high-dimension tensors are correctly formatted
+                # Ensure high-dimensional tensor format is correct
                 tensor = tensor.view(1, 1, -1).contiguous()
                 logger.info(
                     f"Adjusted high-dimension tensor to 3D, new shape={tensor.shape}"
@@ -261,28 +310,27 @@ class ChatTTS_Sampler:
                 logger.warning("Tensor not contiguous, forcing contiguous")
                 tensor = tensor.contiguous()
 
-            # Print final info
             logger.info(
                 f"Final audio tensor: shape={tensor.shape}, dtype={tensor.dtype}, is_contiguous={tensor.is_contiguous()}"
             )
 
             audio = {
-                "waveform": tensor.detach().clone(),  # Create deep copy
+                "waveform": tensor.detach().clone(),  # Create a deep copy
                 "sample_rate": 24000,
             }
 
-            # Ensure correct return data
+            # Ensure the returned data is correct
             meta = {"seed": seed, "spk_emb": spk_emb}
             logger.info(f"Successfully generated audio: shape={tensor.shape}")
             return (audio, meta)
 
         except Exception as e:
-            logger.error(
-                f"Error during audio synthesis: {e}", exc_info=True
-            )  # Add full stack trace
-            # Return empty but correctly formatted audio data
+            logger.error(f"Error during audio synthesis: {e}", exc_info=True)
+            # Return empty but correctly formatted audio data - key fix here!
             empty_audio = {
-                "waveform": torch.zeros((1, 100)),  # Create valid 2D empty audio
+                "waveform": torch.zeros(
+                    (1, 1, 100)
+                ),  # Empty audio in 3D format [batch, channels, samples]
                 "sample_rate": 24000,
             }
             meta = {"seed": seed, "spk_emb": spk_emb, "error": str(e)}
